@@ -1,141 +1,124 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { 
-  View, 
-  Text, 
-  StyleSheet, 
-  TouchableOpacity, 
-  Alert, 
-  ActivityIndicator, 
-  Platform 
+  View, Text, StyleSheet, TouchableOpacity, 
+  Alert, ActivityIndicator, Switch 
 } from "react-native";
-import MapView, { UrlTile, Marker } from "react-native-maps";
+import MapView, { UrlTile, Marker, Polyline } from "react-native-maps";
 import * as Location from "expo-location";
-import { supabase } from "../../supabase";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { supabase } from "../../supabase"; // Back for the SOS signal
+
+const STORAGE_KEY = "@location_history_v1";
 
 export default function EmergencyScreen() {
   const [location, setLocation] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [region, setRegion] = useState(null);
+  const [loading, setLoading] = useState(false); // For SOS button
+  const [isTracking, setIsTracking] = useState(false);
+  const [history, setHistory] = useState([]); 
   const [statusMsg, setStatusMsg] = useState("Initializing GPS...");
+  const locationWatcher = useRef(null);
 
   useEffect(() => {
-    requestLocationPermission();
+    loadLocalHistory();
+    requestPermissions();
+    return () => stopTracking();
   }, []);
 
-  async function requestLocationPermission() {
-    let { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted") {
-      setStatusMsg("Permission Denied");
-      Alert.alert("Permission Denied", "Location access is required for SOS.");
-      return;
-    }
-    fetchCurrentLocation();
-  }
-
-  async function fetchCurrentLocation() {
+  // --- LOCAL PERSISTENCE LOGIC ---
+  async function loadLocalHistory() {
     try {
-      setStatusMsg("Acquiring GPS Signal...");
-      let lastKnown = await Location.getLastKnownPositionAsync({});
-      if (lastKnown) updatePosition(lastKnown);
-
-      let currentLoc = await Location.getCurrentPositionAsync({ 
-        accuracy: Location.Accuracy.Balanced, 
-      });
-      
-      updatePosition(currentLoc);
-      setStatusMsg("GPS Locked");
-    } catch (err) {
-      console.log("Location Error:", err);
-      setStatusMsg("GPS Error: Try moving near a window");
-    }
+      const saved = await AsyncStorage.getItem(STORAGE_KEY);
+      if (saved) setHistory(JSON.parse(saved));
+    } catch (e) { console.error(e); }
   }
 
-  function updatePosition(loc) {
-    const coords = {
-      latitude: loc.coords.latitude,
-      longitude: loc.coords.longitude,
-      latitudeDelta: 0.005,
-      longitudeDelta: 0.005,
-    };
-    setLocation(loc.coords);
-    setRegion(coords);
+  async function saveToLocalHistory(newCoord) {
+    const updatedHistory = [...history, newCoord].slice(-100);
+    setHistory(updatedHistory);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedHistory));
   }
 
-  function handleSOSPress() {
+  // --- SOS SIGNAL (SUPABASE) ---
+  async function handleSOSPress() {
     if (!location) {
-      Alert.alert("GPS Not Ready", "Still acquiring your precise location.");
-      fetchCurrentLocation();
+      Alert.alert("GPS Not Ready", "Still acquiring location.");
       return;
     }
 
-    Alert.alert(
-      "Confirm Emergency",
-      "Your location is being tracked. Alert the authorities immediately?",
-      [
-        { text: "No", style: "cancel" },
-        { text: "Yes", style: "destructive", onPress: () => executeEmergencySignal() }
-      ]
-    );
+    Alert.alert("Confirm Emergency", "Alert Barangay Alijis authorities?", [
+      { text: "No", style: "cancel" },
+      { text: "Yes", style: "destructive", onPress: executeEmergencySignal }
+    ]);
   }
 
   async function executeEmergencySignal() {
     setLoading(true);
     try {
       const { data: { user } } = await supabase.auth.getUser();
-
       const { error } = await supabase.from("emergency").insert([
-        {
-          latitude: location.latitude,
-          longitude: location.longitude,
-          user_id: user?.id,
-          status: "pending" // Ensure this column exists in Supabase!
-        },
+        { latitude: location.latitude, longitude: location.longitude, user_id: user?.id, status: "pending" },
       ]);
-
       if (error) throw error;
-      Alert.alert("🚨 SOS SENT", "Barangay authorities have received your signal.");
+      Alert.alert("🚨 SOS SENT", "Authorities have been notified.");
     } catch (err) {
-      Alert.alert("Database Error", "Make sure the 'status' column exists in your table.");
-    } finally {
-      setLoading(false);
+      Alert.alert("SOS Failed", err.message);
+    } finally { setLoading(false); }
+  }
+
+  // --- TRACKING LOGIC ---
+  async function requestPermissions() {
+    let { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== "granted") { setStatusMsg("Permission Denied"); return; }
+    const current = await Location.getCurrentPositionAsync({});
+    setLocation(current.coords);
+    setStatusMsg("GPS Locked");
+  }
+
+  async function toggleTracking() {
+    if (isTracking) {
+      if (locationWatcher.current) {
+        locationWatcher.current.remove();
+        locationWatcher.current = null;
+      }
+      setIsTracking(false);
+    } else {
+      setIsTracking(true);
+      locationWatcher.current = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.High, distanceInterval: 10 },
+        (newLoc) => {
+          const coord = { latitude: newLoc.coords.latitude, longitude: newLoc.coords.longitude };
+          setLocation(newLoc.coords);
+          saveToLocalHistory(coord);
+        }
+      );
     }
   }
 
   return (
     <View style={styles.container}>
-      <Text style={styles.headerTitle}>Emergency Services</Text>
+      <Text style={styles.headerTitle}>Emergency & Tracking</Text>
 
       <View style={styles.mapContainer}>
-        {Platform.OS === 'web' ? (
-          <View style={styles.mapPlaceholder}>
-            <Text style={styles.webWarning}>Maps are optimized for Mobile devices.</Text>
-          </View>
-        ) : region ? (
-          <MapView style={styles.map} region={region}>
-            <UrlTile 
-                // Using the 'HOT' (Humanitarian) tile server as it's often more reliable
-                urlTemplate="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png" 
-                maximumZ={19}
-                flipY={false}
-                tileHttpServerHeaders={{
-                    "User-Agent": "CHMSU-Barangay-Project-V1-StudentDev"
-                }}
-            />
-            <Marker coordinate={region} title="Your Location" />
+        {location && (
+          <MapView 
+            style={styles.map} 
+            region={{ ...location, latitudeDelta: 0.005, longitudeDelta: 0.005 }}
+          >
+            <UrlTile urlTemplate="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png" />
+            <Polyline coordinates={history} strokeWidth={4} strokeColor="#2e7d32" />
+            <Marker coordinate={location} title="Current Location" />
           </MapView>
-        ) : (
-          <View style={styles.mapPlaceholder}>
-            <ActivityIndicator size="large" color="#c62828" />
-            <Text style={styles.loadingText}>{statusMsg}</Text>
-          </View>
         )}
       </View>
-      
-      <View style={styles.uiBottom}>
-        <Text style={styles.statusSubText}>
-            {location ? `GPS: ${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}` : statusMsg}
-        </Text>
 
+      <View style={styles.uiBottom}>
+        {/* Local History Toggle */}
+        <View style={styles.historyToggle}>
+          <Text style={styles.toggleLabel}>Local History Logging</Text>
+          <Switch value={isTracking} onValueChange={toggleTracking} />
+        </View>
+
+        {/* SOS Button Re-instated */}
         <TouchableOpacity 
           style={[styles.sosButton, loading && styles.disabled]} 
           onPress={handleSOSPress}
@@ -154,17 +137,24 @@ export default function EmergencyScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#fff" },
-  headerTitle: { fontSize: 22, fontWeight: "700", textAlign: "center", marginTop: 60, marginBottom: 20 },
+  headerTitle: { fontSize: 22, fontWeight: "bold", textAlign: "center", marginTop: 60, marginBottom: 10 },
   mapContainer: { height: 260, width: '100%', borderBottomWidth: 1, borderBottomColor: '#eee' },
   map: { flex: 1 },
-  mapPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f9f9f9', padding: 20 },
-  webWarning: { color: '#666', textAlign: 'center', fontSize: 13 },
-  loadingText: { marginTop: 10, color: '#888', fontSize: 12 },
-  statusSubText: { fontSize: 12, color: "#999", marginBottom: 20 },
-  uiBottom: { flex: 1, justifyContent: "center", alignItems: "center", padding: 25 },
-  sosButton: { width: 190, height: 190, borderRadius: 95, backgroundColor: "#FFEBEE", justifyContent: "center", alignItems: "center" },
-  sosInner: { width: 160, height: 160, borderRadius: 80, backgroundColor: "#c62828", justifyContent: "center", alignItems: "center", elevation: 12 },
-  sosText: { color: "white", fontSize: 40, fontWeight: "900" },
+  uiBottom: { flex: 1, justifyContent: "center", alignItems: "center", padding: 20 },
+  historyToggle: { 
+    flexDirection: 'row', 
+    alignItems: 'center', 
+    justifyContent: 'space-between', 
+    width: '100%', 
+    backgroundColor: '#f9f9f9', 
+    padding: 12, 
+    borderRadius: 12,
+    marginBottom: 20
+  },
+  toggleLabel: { fontSize: 14, fontWeight: '600', color: '#555' },
+  sosButton: { width: 180, height: 180, borderRadius: 90, backgroundColor: "#FFEBEE", justifyContent: "center", alignItems: "center" },
+  sosInner: { width: 150, height: 150, borderRadius: 75, backgroundColor: "#c62828", justifyContent: "center", alignItems: "center", elevation: 10 },
+  sosText: { color: "white", fontSize: 36, fontWeight: "900" },
   disabled: { opacity: 0.5 },
-  warningText: { marginTop: 40, textAlign: "center", color: "#d32f2f", fontSize: 11, fontWeight: '600' }
+  warningText: { marginTop: 25, color: "#d32f2f", fontSize: 11, fontWeight: '600' }
 });
